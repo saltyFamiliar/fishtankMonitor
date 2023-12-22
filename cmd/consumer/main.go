@@ -1,74 +1,37 @@
 package main
 
 import (
+	. "fishScraper/internal/consumer"
+	"fishScraper/internal/messages"
+	"fishScraper/internal/utils"
 	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"net/http"
-	"strconv"
-
 	"github.com/streadway/amqp"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
 )
 
 func main() {
+	filepath := "mentions.csv"
+
 	conn, err := amqp.Dial("amqp://localhost:5672/")
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
+	utils.Must("connection to amqp server", err)
 
 	ch, err := conn.Channel()
-	if err != nil {
-		panic(err)
-	}
-	defer ch.Close()
+	utils.Must("create chat_count connection channel", err)
 
-	q, err := ch.QueueDeclare(
-		"chat_count", // name
-		false,        // durable
-		false,        // delete when unused
-		false,        // exclusive
-		false,        // no-wait
-		nil,          // arguments
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	nameCh, err := conn.Channel()
-	if err != nil {
-		panic(err)
-	}
-
-	qname, err := nameCh.QueueDeclare(
-		"char_names",
-		false, false, false, false, nil,
-	)
-
-	// Consume the messages
-	nameMsgs, err := nameCh.Consume(
-		qname.Name,
-		"",
-		true, false, false, false, nil,
-	)
-
-	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		http.ListenAndServe(":8080", nil)
+	defer func() {
+		_ = conn.Close()
+		_ = ch.Close()
 	}()
+
+	chatCount, err := messages.DeclareAndConsume(ch, "chat_count")
+	charNames, err := messages.DeclareAndConsume(ch, "char_names")
+	msgTotal, err := messages.DeclareAndConsume(ch, "message_total")
 
 	chatUsers := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "viewers_total",
@@ -76,39 +39,33 @@ func main() {
 	})
 	prometheus.MustRegister(chatUsers)
 
-	charCounters := map[string]prometheus.Counter{
-		"cole":     prometheus.NewCounter(prometheus.CounterOpts{Name: "cole", Help: "cole mentions"}),
-		"jc":       prometheus.NewCounter(prometheus.CounterOpts{Name: "jc", Help: "jc mentions"}),
-		"jimmy":    prometheus.NewCounter(prometheus.CounterOpts{Name: "jimmy", Help: "jimmy mentions"}),
-		"megan":    prometheus.NewCounter(prometheus.CounterOpts{Name: "megan", Help: "megan mentions"}),
-		"shinji":   prometheus.NewCounter(prometheus.CounterOpts{Name: "shinji", Help: "shinji mentions"}),
-		"summer":   prometheus.NewCounter(prometheus.CounterOpts{Name: "summer", Help: "summer mentions"}),
-		"tayleigh": prometheus.NewCounter(prometheus.CounterOpts{Name: "tayleigh", Help: "tayleigh mentions"}),
-		"trisha":   prometheus.NewCounter(prometheus.CounterOpts{Name: "trisha", Help: "trisha mentions"}),
-		"brian":    prometheus.NewCounter(prometheus.CounterOpts{Name: "brian", Help: "brian mentions"}),
-		"tj":       prometheus.NewCounter(prometheus.CounterOpts{Name: "tj", Help: "tj mentions"}),
+	charCounters := map[string]*Character{
+		"cole":     {prometheus.NewCounter(prometheus.CounterOpts{Name: "cole", Help: "cole mentions"}), 0},
+		"jc":       {prometheus.NewCounter(prometheus.CounterOpts{Name: "jc", Help: "jc mentions"}), 0},
+		"jimmy":    {prometheus.NewCounter(prometheus.CounterOpts{Name: "jimmy", Help: "jimmy mentions"}), 0},
+		"megan":    {prometheus.NewCounter(prometheus.CounterOpts{Name: "megan", Help: "megan mentions"}), 0},
+		"shinji":   {prometheus.NewCounter(prometheus.CounterOpts{Name: "shinji", Help: "shinji mentions"}), 0},
+		"summer":   {prometheus.NewCounter(prometheus.CounterOpts{Name: "summer", Help: "summer mentions"}), 0},
+		"tayleigh": {prometheus.NewCounter(prometheus.CounterOpts{Name: "tayleigh", Help: "tayleigh mentions"}), 0},
+		"trisha":   {prometheus.NewCounter(prometheus.CounterOpts{Name: "trisha", Help: "trisha mentions"}), 0},
+		"brian":    {prometheus.NewCounter(prometheus.CounterOpts{Name: "brian", Help: "brian mentions"}), 0},
+		"tj":       {prometheus.NewCounter(prometheus.CounterOpts{Name: "tj", Help: "tj mentions"}), 0},
 	}
-
-	//reset counter to position before restart (wow)
-	charCounters["cole"].Add(1245)
-	charCounters["jimmy"].Add(2471)
-	charCounters["jc"].Add(927)
-	charCounters["brian"].Add(702)
-	charCounters["megan"].Add(889)
-	charCounters["shinji"].Add(1403)
-	charCounters["summer"].Add(2594)
-	charCounters["tayleigh"].Add(539)
-	charCounters["trisha"].Add(852)
-	charCounters["tj"].Add(2018)
-
+	ReadCounts(filepath, charCounters)
 	for name := range charCounters {
-		prometheus.MustRegister(charCounters[name])
+		prometheus.MustRegister(charCounters[name].Counter)
 	}
 
-	forever := make(chan bool)
+	messageCounter := prometheus.NewCounter(prometheus.CounterOpts{Name: "message_total", Help: "total messages"})
+	prometheus.MustRegister(messageCounter)
 
 	go func() {
-		for d := range msgs {
+		http.Handle("/metrics", promhttp.Handler())
+		utils.Must("create prometheus metrics server", http.ListenAndServe(":8080", nil))
+	}()
+
+	go func() {
+		for d := range chatCount {
 			fmt.Printf("Received: %s\n", d.Body)
 			count, err := strconv.Atoi(string(d.Body))
 			if err != nil {
@@ -122,13 +79,27 @@ func main() {
 	}()
 
 	go func() {
-		for name := range nameMsgs {
+		for name := range charNames {
 			nameStr := string(name.Body)
 			println("received name: ", nameStr)
-			charCounters[nameStr].Add(1)
+			charCounters[nameStr].Counter.Add(1)
+			charCounters[nameStr].Count++
+		}
+	}()
+
+	go func() {
+		for msgCount := range msgTotal {
+			totalStr := string(msgCount.Body)
+			floatTotal, _ := strconv.ParseFloat(totalStr, 64)
+			println("total messages: ", floatTotal)
+			messageCounter.Add(floatTotal)
 		}
 	}()
 
 	fmt.Println("Waiting for messages.")
-	<-forever
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	<-sigCh
+	WriteCounts(filepath, charCounters)
 }

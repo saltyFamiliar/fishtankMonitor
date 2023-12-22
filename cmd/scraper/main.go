@@ -3,41 +3,12 @@ package main
 import (
 	"fishScraper/internal/messages"
 	"fishScraper/internal/scraper"
+	. "fishScraper/internal/scraper"
 	"fishScraper/internal/utils"
 	"fmt"
-	"strings"
+	"strconv"
 	"time"
 )
-
-type Character struct {
-	names    []string
-	mentions int
-}
-
-func BuildNameMap(characters []*Character) map[string]*Character {
-	nameMap := make(map[string]*Character)
-
-	for _, char := range characters {
-		for _, name := range char.names {
-			nameMap[name] = char
-		}
-	}
-
-	return nameMap
-}
-
-func findCharactersInMsg(nameCharMap map[string]*Character, msg string, resCh chan *Character) {
-	mentioned := make(map[*Character]bool)
-	words := strings.Fields(msg)
-	for _, w := range words {
-		if char, ok := nameCharMap[strings.ToLower(w)]; ok {
-			if !mentioned[char] {
-				resCh <- char
-			}
-			mentioned[char] = true
-		}
-	}
-}
 
 var charList = []*Character{
 	{[]string{"cole"}, 0},
@@ -62,6 +33,7 @@ func main() {
 	utils.Must("initialize chat_count queue", err)
 	nameCh, nameConn, err := messages.InitQueue("char_names", mqUrl)
 	utils.Must("initialize char_names queue", err)
+	msgCountCh, msgCountConn, err := messages.InitQueue("message_total", mqUrl)
 
 	defer func() {
 		defer utils.Must("close chrome driver", wd.Close())
@@ -70,6 +42,8 @@ func main() {
 		defer utils.Must("close chat_count mq channel", mqCh.Close())
 		defer utils.Must("close char_names mq connection", nameConn.Close())
 		defer utils.Must("close char_names mq channel", nameCh.Close())
+		defer utils.Must("close message_total mq connection", msgCountConn.Close())
+		defer utils.Must("close message_total mq channel", msgCountCh.Close())
 	}()
 
 	fmt.Println("Press enter when you've logged in and the chat count has loaded.")
@@ -94,6 +68,7 @@ func main() {
 
 	//get new messages
 	msgCh := make(chan []string)
+	msgCountChInternal := make(chan int)
 	go func() {
 		seenMsgs := make(map[string]bool)
 		for {
@@ -104,6 +79,7 @@ func main() {
 			}
 
 			msgCh <- newMsgs
+			msgCountChInternal <- len(newMsgs)
 		}
 	}()
 
@@ -112,7 +88,7 @@ func main() {
 	//publish mentions
 	go func() {
 		for char := range mentionCh {
-			err = messages.PublishStringMetric(nameCh, char.names[0], "char_names")
+			err = messages.PublishStringMetric(nameCh, char.Names[0], "char_names")
 			if err != nil {
 				println("problem publishing name")
 			}
@@ -120,11 +96,22 @@ func main() {
 		}
 	}()
 
+	//publish messageCount
+	go func() {
+		for msgCount := range msgCountChInternal {
+			err = messages.PublishStringMetric(msgCountCh, strconv.Itoa(msgCount), "message_total")
+			if err != nil {
+				println("problem publishing message count")
+			}
+		}
+
+	}()
+
 	//search for mentions
 	nameCharMap := BuildNameMap(charList)
 	for msgs := range msgCh {
 		for _, msg := range msgs {
-			go findCharactersInMsg(nameCharMap, msg, mentionCh)
+			go FindCharactersInMsg(nameCharMap, msg, mentionCh)
 		}
 	}
 }
